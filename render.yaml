@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: zm-apollo-mcp
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: APOLLO_API_KEY
+        sync: false
+      - key: AUTHKIT_DOMAIN
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: ALLOWED_EMAILS
+        sync: false
+      - key: DAILY_REVEAL_CAP
+        value: "50"
