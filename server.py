@@ -45,6 +45,11 @@ from fastmcp.server.dependencies import get_access_token
 APOLLO = "https://api.apollo.io/api/v1"
 APOLLO_KEY = os.environ["APOLLO_API_KEY"]
 ALLOWED_EMAILS = {e.strip().lower() for e in os.environ.get("ALLOWED_EMAILS", "").split(",") if e.strip()}
+# WorkOS user ids (the stable "sub" claim, e.g. user_01ABC...). This is the
+# reliable gate: WorkOS always puts sub in the token, whereas the email only
+# comes back on some calls. Either an allowed email OR an allowed sub lets a
+# caller through.
+ALLOWED_SUBS = {s.strip() for s in os.environ.get("ALLOWED_SUBS", "").split(",") if s.strip()}
 DAILY_REVEAL_CAP = int(os.environ.get("DAILY_REVEAL_CAP", "50"))
 AUTHKIT_DOMAIN = os.environ["AUTHKIT_DOMAIN"].rstrip("/")
 USERINFO_URL = os.environ.get("USERINFO_URL", f"{AUTHKIT_DOMAIN}/oauth2/userinfo")
@@ -103,58 +108,64 @@ def _b64url_json(seg):
         return {}
 
 
-def _caller_email():
-    """Resolve the authenticated caller's email. Tries, in order: the verified
-    token claims, the raw JWT payload, then the OIDC userinfo endpoint. Cached
-    per access token. Logs (flushed) wherever a step comes up empty so the
-    reason is visible in the server logs."""
+def _caller_identity():
+    """Return (email, sub) for the authenticated caller.
+
+    `sub` is the stable WorkOS user id and is present on every token — it's the
+    reliable gate. `email` is best-effort (claims -> raw JWT -> userinfo) and may
+    come back '' because WorkOS only surfaces it on some calls. Logs (flushed)
+    when email can't be resolved, so the reason stays visible in the server logs.
+    """
     tok = get_access_token()
     raw = getattr(tok, "token", None)
     claims = getattr(tok, "claims", None) or {}
-    # 1) straight from the verified claims
-    for k in ("email", "user_email", "https://workos.com/email"):
-        v = claims.get(k)
-        if v:
-            return str(v).lower()
-    # 2) decode the raw JWT payload directly (WorkOS may carry email there)
-    if raw and raw.count(".") == 2:
-        payload = _b64url_json(raw.split(".")[1])
-        for k in ("email", "user_email"):
-            v = payload.get(k)
+    payload = _b64url_json(raw.split(".")[1]) if (raw and raw.count(".") == 2) else {}
+
+    sub = str(claims.get("sub") or payload.get("sub") or "")
+
+    email = ""
+    for src in (claims, payload):
+        for k in ("email", "user_email", "https://workos.com/email"):
+            v = src.get(k)
             if v:
-                return str(v).lower()
-        print(f"[auth] jwt payload keys={sorted(payload)}", file=sys.stderr, flush=True)
-    # 3) OIDC userinfo (needs the email scope on the token)
-    if raw and raw in _email_cache:
-        return _email_cache[raw]
-    if raw:
-        try:
-            r = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {raw}"}, timeout=15)
-            if r.ok:
-                body = r.json()
-                email = (body.get("email") or "").lower()
-                _email_cache[raw] = email
-                if not email:
-                    print(f"[auth] userinfo ok, no email; keys={sorted(body)}", file=sys.stderr, flush=True)
-                return email
-            print(f"[auth] userinfo {r.status_code}: {r.text[:120]}", file=sys.stderr, flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[auth] userinfo error {str(e)[:100]}", file=sys.stderr, flush=True)
-    else:
-        print(f"[auth] no raw token; claim keys={sorted(claims)}", file=sys.stderr, flush=True)
-    return ""
+                email = str(v).lower()
+                break
+        if email:
+            break
+    # Fall back to the OIDC userinfo endpoint (needs the email scope on the token)
+    if not email and raw:
+        if raw in _email_cache:
+            email = _email_cache[raw]
+        else:
+            try:
+                r = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {raw}"}, timeout=15)
+                if r.ok:
+                    body = r.json()
+                    email = (body.get("email") or "").lower()
+                    _email_cache[raw] = email
+                    if not email:
+                        print(f"[auth] userinfo ok, no email; keys={sorted(body)} sub={sub}", file=sys.stderr, flush=True)
+                else:
+                    print(f"[auth] userinfo {r.status_code}: {r.text[:120]} sub={sub}", file=sys.stderr, flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[auth] userinfo error {str(e)[:100]} sub={sub}", file=sys.stderr, flush=True)
+    return email, sub
 
 
 def _require_allowed():
-    """Raise if the caller isn't on the allowlist. Fail-closed."""
-    if not ALLOWED_EMAILS:
-        return  # no allowlist configured => open to any authenticated user
-    email = _caller_email()
-    if email not in ALLOWED_EMAILS:
-        raise PermissionError(
-            "This Apollo connector is restricted. Your sign-in isn't on its "
-            "allowlist — ask Danny to add you." + (f" (signed in as {email})" if email else "")
-        )
+    """Raise if the caller is on neither allowlist. Fail-closed. A caller passes
+    on EITHER an allowed email or an allowed WorkOS id (sub)."""
+    if not ALLOWED_EMAILS and not ALLOWED_SUBS:
+        return  # nothing configured => open to any authenticated user
+    email, sub = _caller_identity()
+    if (email and email in ALLOWED_EMAILS) or (sub and sub in ALLOWED_SUBS):
+        return
+    print(f"[auth] REFUSED email={email or 'none'} sub={sub or 'none'}", file=sys.stderr, flush=True)
+    raise PermissionError(
+        "This Apollo connector is restricted — ask Danny to add you. "
+        f"Give him this id: {sub or 'unknown'}"
+        + (f" (email {email})" if email else "")
+    )
 
 
 def _post(path, body, tries=5):
