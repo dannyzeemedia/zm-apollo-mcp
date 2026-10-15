@@ -32,6 +32,8 @@ Env vars (set in Render):
 import os
 import sys
 import time
+import json
+import base64
 import datetime
 import threading
 
@@ -50,6 +52,11 @@ USERINFO_URL = os.environ.get("USERINFO_URL", f"{AUTHKIT_DOMAIN}/oauth2/userinfo
 auth = AuthKitProvider(
     authkit_domain=AUTHKIT_DOMAIN,
     base_url=os.environ["PUBLIC_URL"],
+    # Advertise the identity scopes so the MCP client (claude.ai) requests them.
+    # Without this the issued token carries no email, so the allowlist can't tell
+    # who is calling and refuses everyone. Not enforced on the token — just
+    # advertised — so a client that omits one still authenticates.
+    scopes_supported=["openid", "profile", "email"],
 )
 mcp = FastMCP("Zee.Media Apollo Research", auth=auth)
 
@@ -87,30 +94,54 @@ def _add_reveals(n):
 _email_cache = {}
 
 
+def _b64url_json(seg):
+    """Decode one base64url JWT segment to a dict; {} on any problem."""
+    try:
+        pad = "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg + pad))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _caller_email():
-    """Resolve the authenticated caller's email from the token claims, falling
-    back to the OIDC userinfo endpoint. Cached per access token."""
+    """Resolve the authenticated caller's email. Tries, in order: the verified
+    token claims, the raw JWT payload, then the OIDC userinfo endpoint. Cached
+    per access token. Logs (flushed) wherever a step comes up empty so the
+    reason is visible in the server logs."""
     tok = get_access_token()
     raw = getattr(tok, "token", None)
     claims = getattr(tok, "claims", None) or {}
+    # 1) straight from the verified claims
     for k in ("email", "user_email", "https://workos.com/email"):
         v = claims.get(k)
         if v:
             return str(v).lower()
+    # 2) decode the raw JWT payload directly (WorkOS may carry email there)
+    if raw and raw.count(".") == 2:
+        payload = _b64url_json(raw.split(".")[1])
+        for k in ("email", "user_email"):
+            v = payload.get(k)
+            if v:
+                return str(v).lower()
+        print(f"[auth] jwt payload keys={sorted(payload)}", file=sys.stderr, flush=True)
+    # 3) OIDC userinfo (needs the email scope on the token)
     if raw and raw in _email_cache:
         return _email_cache[raw]
     if raw:
         try:
             r = requests.get(USERINFO_URL, headers={"Authorization": f"Bearer {raw}"}, timeout=15)
             if r.ok:
-                email = (r.json().get("email") or "").lower()
+                body = r.json()
+                email = (body.get("email") or "").lower()
                 _email_cache[raw] = email
+                if not email:
+                    print(f"[auth] userinfo ok, no email; keys={sorted(body)}", file=sys.stderr, flush=True)
                 return email
-            print(f"[auth] userinfo {r.status_code}; claim keys={list(claims)}", file=sys.stderr)
+            print(f"[auth] userinfo {r.status_code}: {r.text[:120]}", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001
-            print(f"[auth] userinfo error {str(e)[:80]}; claim keys={list(claims)}", file=sys.stderr)
+            print(f"[auth] userinfo error {str(e)[:100]}", file=sys.stderr, flush=True)
     else:
-        print(f"[auth] no raw token; claim keys={list(claims)}", file=sys.stderr)
+        print(f"[auth] no raw token; claim keys={sorted(claims)}", file=sys.stderr, flush=True)
     return ""
 
 
